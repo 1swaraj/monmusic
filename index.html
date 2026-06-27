@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="theme-color" content="#0E091C">
 <title>BLOCKBEAT — the chain, performed</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js" integrity="sha512-jduERlz7En1IUZR54bqzpNI64AbffZWR//KJgF71SJ8D8/liKFZ+s1RxmUmB+bhCnIfzebdZsULwOrbVB5f3nQ==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -169,6 +169,9 @@
 
 const BLOCK_MS = 400;        // Monad's real block time. the metronome.
 const HIST = 44;             // blocks kept on screen (matches shader)
+const LOAD_FULL = 0.16;      // gasUsed/gasLimit that maps to a full-height, hottest bar.
+                             // Mainnet load runs ~3-15%, so this spreads that band across
+                             // the full visual range instead of leaving every bar tiny/blue.
 
 /* --- deterministic PRNG: same seed -> same stream ------------------------- */
 function mulberry32(a){
@@ -200,7 +203,7 @@ function nextBlock(forcedPulse){
   let hash='0x';
   for(let i=0;i<32;i++) hash += Math.floor(rng()*256).toString(16).padStart(2,'0');
 
-  return { num:blockNum, hash, txCount, load:congestion, user:!!forcedPulse };
+  return { num:blockNum, hash, txCount, loadRaw:congestion, load:congestion, user:!!forcedPulse };
 }
 
 /* --- live Monad block source (primary) ----------------------------------- */
@@ -223,11 +226,13 @@ async function rpc(method, params){
 function fetchBlock(tag){ return rpc('eth_getBlockByNumber', [tag, false]); } // false = tx hashes only
 function mapBlock(raw){
   const gasUsed = Number(raw.gasUsed||0), gasLimit = Number(raw.gasLimit||0)||1;
+  const loadRaw = Math.max(0, Math.min(1, gasUsed/gasLimit));   // true network load (gasUsed/gasLimit)
   return {
     num: Number(raw.number),
     hash: raw.hash,
     txCount: raw.transactions ? raw.transactions.length : 0,
-    load: Math.max(0, Math.min(1, gasUsed/gasLimit)),
+    loadRaw,
+    load: Math.min(1, loadRaw/LOAD_FULL),                       // normalized to the operating band (drives bar size + color)
     user: false
   };
 }
@@ -479,7 +484,7 @@ window.addEventListener('resize', resize);
 const history = [];   // [{amp,load,user}]
 let texDirty = true;
 function pushHistory(block){
-  history.unshift({ amp: Math.min(1, block.txCount/3500), load: block.load, user: block.user });
+  history.unshift({ amp: block.load, load: block.load, user: block.user });   // bar height + color from normalized load
   if(history.length > HIST) history.pop();
   texDirty = true;
 }
@@ -504,10 +509,10 @@ function updateReadout(block,notes){
   $('r-block').textContent = 'BLOCK #'+block.num.toLocaleString();
   $('r-hash').textContent  = block.hash.slice(0,4)+'…'+block.hash.slice(-3);
   $('r-tx').textContent    = 'TX: '+block.txCount.toLocaleString();
-  const pct = Math.round(block.load*100);
+  const pct = Math.round((block.loadRaw!=null?block.loadRaw:block.load)*100);   // show TRUE load %
   const el = $('r-load');
   el.textContent = pct+'%';
-  el.style.color = heatCss(block.load,1);
+  el.style.color = heatCss(block.load,1);                                       // color from normalized load
   $('r-note').textContent = 'NOTE: '+(block.user?'★ ':'')+notes.join(' ');
 }
 
