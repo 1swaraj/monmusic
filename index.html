@@ -155,10 +155,11 @@
    BLOCKBEAT — the chain as a generative instrument
    ----------------------------------------------------------------------------
    A PURE FUNCTION of a block stream: same blocks + same renderer -> identical
-   sound and image, forever. The block stream here is a seeded simulator with
-   Monad-like dynamics (400ms blocks, bursty load, occasional congestion).
-   Swapping in a live RPC is one function: replace nextBlock() with a poll of
-   eth_getBlockByNumber.
+   sound and image, forever. The block stream is the LIVE Monad chain, polled
+   over JSON-RPC (eth_getBlockByNumber). load = gasUsed/gasLimit, density = real
+   tx count, pitch = real block hash. If the RPC is unreachable the piece falls
+   back to a seeded simulator with Monad-like dynamics so it never goes silent.
+   Endpoint overridable with ?rpc=<url> or ?chain=testnet.
 
    Visual system follows the Monad design system: Dark Navy ground, blueprint
    grid, a data-driven WebGL seismograph whose heat ramp runs Light Blue ->
@@ -200,6 +201,77 @@ function nextBlock(forcedPulse){
   for(let i=0;i<32;i++) hash += Math.floor(rng()*256).toString(16).padStart(2,'0');
 
   return { num:blockNum, hash, txCount, load:congestion, user:!!forcedPulse };
+}
+
+/* --- live Monad block source (primary) ----------------------------------- */
+const RPC = { mainnet:'https://rpc.monad.xyz', testnet:'https://testnet-rpc.monad.xyz' };
+const Q = new URLSearchParams(location.search);
+const CHAIN = (Q.get('chain')||'mainnet').toLowerCase();
+const RPC_URL = Q.get('rpc') || RPC[CHAIN] || RPC.mainnet;
+
+let _rpcId = 1;
+async function rpc(method, params){
+  const r = await fetch(RPC_URL, {
+    method:'POST', headers:{'content-type':'application/json'},
+    body: JSON.stringify({jsonrpc:'2.0', id:_rpcId++, method, params})
+  });
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  const j = await r.json();
+  if(j.error) throw new Error(j.error.message||'rpc error');
+  return j.result;
+}
+function fetchBlock(tag){ return rpc('eth_getBlockByNumber', [tag, false]); } // false = tx hashes only
+function mapBlock(raw){
+  const gasUsed = Number(raw.gasUsed||0), gasLimit = Number(raw.gasLimit||0)||1;
+  return {
+    num: Number(raw.number),
+    hash: raw.hash,
+    txCount: raw.transactions ? raw.transactions.length : 0,
+    load: Math.max(0, Math.min(1, gasUsed/gasLimit)),
+    user: false
+  };
+}
+
+let live=false, lastNum=null, polling=false, pollTimer=null;
+const queue=[];
+
+// seed the scope with recent real blocks, then mark the stream live.
+// Only the latest block is required; backfill is best-effort so a rate-limited
+// burst can't kill the connect (throws only if the chain is fully unreachable).
+async function connectLive(){
+  const latest = await fetchBlock('latest');
+  const ln = Number(latest.number);
+  const N = Math.min(HIST, 24);
+  const nums=[]; for(let n=ln-1; n>ln-N && n>=0; n--) nums.push(n);          // older blocks (descending)
+  const settled = await Promise.allSettled(nums.map(n => fetchBlock('0x'+n.toString(16))));
+  const olders = settled.filter(s => s.status==='fulfilled').map(s => s.value);
+  const ordered = [latest, ...olders];                                       // newest-first
+  history.length = 0;
+  for(let i=ordered.length-1;i>=0;i--) pushHistory(mapBlock(ordered[i]));     // oldest first -> newest ends at front
+  while(history.length < HIST) history.push({amp:0,load:0,user:false});
+  texDirty = true;
+  lastNum = ln; live = true;
+  const newest = mapBlock(latest);
+  targetLoad = loadDisp = newest.load;
+  updateReadout(newest, blockToNotes(newest));
+}
+
+// poll for new blocks and enqueue them for the beat ticker to consume
+async function pollOnce(){
+  if(polling || !live) return; polling=true;
+  try{
+    const latest = await fetchBlock('latest');
+    const ln = Number(latest.number);
+    if(ln > lastNum){
+      const from = Math.max(lastNum+1, ln-6);          // cap backfill so we never flood
+      for(let n=from; n<=ln; n++){
+        queue.push(n===ln ? latest : await fetchBlock('0x'+n.toString(16)));
+      }
+      lastNum = ln;
+      if(queue.length > 8) queue.splice(0, queue.length-8); // stay near real-time if we fall behind
+    }
+  }catch(e){ /* transient hiccup; retry next poll */ }
+  finally{ polling=false; }
 }
 
 /* --- musical mapping: a block -> notes (D minor pentatonic) --------------- */
@@ -439,37 +511,56 @@ function updateReadout(block,notes){
   $('r-note').textContent = 'NOTE: '+(block.user?'★ ':'')+notes.join(' ');
 }
 
-function tick(forced){
-  const block = nextBlock(forced);
+function setStatus(t){ $('status-text').textContent = t; }
+
+function beatTick(){
+  let block;
+  if(live){
+    const raw = queue.shift();
+    if(!raw) return;                 // no new Monad block this beat — hold (silent)
+    block = mapBlock(raw);
+  }else{
+    block = nextBlock(false);        // simulator fallback (RPC offline)
+  }
   const notes = blockToNotes(block);
   if(audio) playBlock(block,notes);
   pushHistory(block);
   targetLoad = block.load;
   lastTick = performance.now();
-  if(forced) pulseEnv = 1;
   updateReadout(block,notes);
 }
 
 let timer=null;
-function startTransport(){
+async function startTransport(){
   if(running) return;
   running=true;
   document.body.classList.add('playing');
   $('center').classList.add('live');
   $('status').classList.add('on');
-  $('status-text').textContent='400MS · SYNCHRONIZED';
   $('btn-stop').disabled=false;
+  setStatus('CONNECTING…');
+  try{
+    await connectLive();
+    setStatus('LIVE · '+CHAIN.toUpperCase());
+    clearInterval(pollTimer); pollTimer=setInterval(pollOnce, 250);
+  }catch(e){
+    live=false;
+    console.warn('Monad RPC unavailable — falling back to simulator:', e);
+    setStatus('SIM · RPC OFFLINE');
+  }
   lastTick=performance.now();
-  tick(false);
-  timer=setInterval(()=>tick(false), BLOCK_MS);
+  clearInterval(timer); timer=setInterval(beatTick, BLOCK_MS);
+  if(!live) beatTick();              // sim starts instantly; live waits for the next block
 }
 function stop(){
-  running=false; clearInterval(timer); timer=null;
+  running=false;
+  clearInterval(timer); timer=null;
+  clearInterval(pollTimer); pollTimer=null;
   if(audio){ audio.drone.triggerRelease(); audio=null; }
   document.body.classList.remove('playing');
   $('center').classList.remove('live');
   $('status').classList.remove('on');
-  $('status-text').textContent='400MS · STANDBY';
+  setStatus('400MS · STANDBY');
   $('btn-stop').disabled=true;
 }
 // audio can't resume without a user gesture in most browsers; unlock on first interaction
@@ -489,7 +580,7 @@ window.addEventListener('keydown', e=>{
   if(e.code==='Space'||e.code==='Enter'){ e.preventDefault(); begin(); }
 });
 
-/* --- prefill so the scope looks alive before "begin" (like the mockup) --- */
+/* --- idle placeholder scope before START (replaced by real blocks on connect) --- */
 let seedBlock, seedNotes;
 for(let i=0;i<HIST;i++){ seedBlock = nextBlock(false); pushHistory(seedBlock); }
 seedNotes = blockToNotes(seedBlock);
